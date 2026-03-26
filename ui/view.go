@@ -383,6 +383,9 @@ func (m Model) renderProviderPill() string {
 
 func (m Model) renderPlaylistHeader() string {
 	if m.focus == focusProvider {
+		if m.provider == nil {
+			return ""
+		}
 		return dimStyle.Render(fmt.Sprintf("── %s Playlists ──", m.provider.Name()))
 	}
 

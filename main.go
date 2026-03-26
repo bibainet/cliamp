@@ -15,7 +15,7 @@ import (
 	"cliamp/external/radio"
 	"cliamp/external/spotify"
 	"cliamp/external/ytmusic"
-	"cliamp/internal/resume"
+	// "cliamp/internal/resume"
 	"cliamp/mpris"
 	"cliamp/player"
 	"cliamp/playlist"
@@ -36,9 +36,10 @@ func run(overrides config.Overrides, positional []string) error {
 	overrides.Apply(&cfg)
 
 	// Build provider list: Radio is always available, Navidrome and Spotify if configured.
-	radioProv := radio.New()
 	var providers []ui.ProviderEntry
-	providers = append(providers, ui.ProviderEntry{Key: "radio", Name: "Radio", Provider: radioProv})
+	if cfg.Provider != "" && cfg.Provider != "none" {
+		providers = append(providers, ui.ProviderEntry{Key: "radio", Name: "Radio", Provider: radio.New()})
+	}
 
 	var navClient *navidrome.NavidromeClient
 	if c := navidrome.NewFromConfig(cfg.Navidrome); c != nil {
@@ -132,14 +133,8 @@ func run(overrides config.Overrides, positional []string) error {
 		return err
 	}
 
-	// Determine default provider key.
-	defaultProvider := cfg.Provider
-	if defaultProvider == "" {
-		defaultProvider = "radio"
-	}
-
 	// No args + radio provider: stream the built-in radio directly.
-	if len(positional) == 0 && defaultProvider == "radio" {
+	if len(positional) == 0 && cfg.Provider == "radio" {
 		resolved.Pending = append(resolved.Pending, "https://radio.cliamp.stream/streams.m3u")
 	}
 
@@ -180,7 +175,7 @@ func run(overrides config.Overrides, positional []string) error {
 
 	themes := theme.LoadAll()
 
-	m := ui.NewModel(p, pl, providers, defaultProvider, localProv, themes, cfg.Navidrome, navClient)
+	m := ui.NewModel(p, pl, providers, cfg.Provider, localProv, themes, cfg.Navidrome, navClient)
 	m.SetSeekStepLarge(cfg.SeekStepLargeDuration())
 	m.SetPendingURLs(resolved.Pending)
 	if len(resolved.Tracks) == 0 && len(resolved.Pending) == 0 {
@@ -203,9 +198,11 @@ func run(overrides config.Overrides, positional []string) error {
 	}
 
 	// PositionSec == 0 is indistinguishable from "never played"; skip resume.
+	/*
 	if rs := resume.Load(); rs.Path != "" && rs.PositionSec > 0 {
 		m.SetResume(rs.Path, rs.PositionSec)
 	}
+	*/
 
 	prog := tea.NewProgram(m, tea.WithAltScreen())
 
@@ -214,6 +211,7 @@ func run(overrides config.Overrides, positional []string) error {
 		go prog.Send(mpris.InitMsg{Svc: svc})
 	}
 
+	/*
 	finalModel, err := prog.Run()
 	if err != nil {
 		return err
@@ -231,8 +229,10 @@ func run(overrides config.Overrides, positional []string) error {
 			resume.Save(path, secs)
 		}
 	}
+	*/
 
-	return nil
+	_, err = prog.Run()
+	return err
 }
 
 const helpText = `cliamp — retro terminal music player
