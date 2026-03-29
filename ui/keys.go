@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"cliamp/config"
+	"cliamp/external/radio"
 	"cliamp/internal/fileutil"
 	"cliamp/playlist"
 )
@@ -51,11 +52,6 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	// Navidrome explore browser overlay
 	if m.navBrowser.visible {
 		return m.handleNavBrowserKey(msg)
-	}
-
-	// Radio catalog overlay
-	if m.radioCatalog.visible {
-		return m.handleRadioCatalogKey(msg)
 	}
 
 	// Theme picker overlay — interactive navigation
@@ -152,6 +148,8 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			} else if len(m.providerLists) > 0 {
 				m.provCursor = 0
 			}
+			// Auto-load next catalog page when scrolling near the bottom.
+			return m.maybeLoadRadioBatch()
 		case "enter":
 			if m.provSignIn {
 				if auth, ok := m.provider.(playlist.Authenticator); ok {
@@ -175,14 +173,30 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			m.provSearch.query = ""
 			m.provSearch.results = nil
 			m.provSearch.cursor = 0
+		case "f":
+			return m.toggleProviderFavorite()
 		case "o":
 			m.openFileBrowser()
 		case "N":
 			if m.navClient != nil {
 				m.openNavBrowser()
 			}
-		case "R":
-			return m.openRadioCatalog()
+		case "pgup", "ctrl+u":
+			if m.provCursor > 0 {
+				m.provCursor -= min(m.provCursor, m.plVisible)
+			}
+		case "pgdown", "ctrl+d":
+			if m.provCursor < len(m.providerLists)-1 {
+				m.provCursor = min(len(m.providerLists)-1, m.provCursor+m.plVisible)
+			}
+			return m.maybeLoadRadioBatch()
+		case "g", "home":
+			m.provCursor = 0
+		case "G", "end":
+			if len(m.providerLists) > 0 {
+				m.provCursor = len(m.providerLists) - 1
+			}
+			return m.maybeLoadRadioBatch()
 		case "J":
 			m.openJumpMode()
 		case "x":
@@ -440,8 +454,10 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			m.queue.cursor = 0
 		}
 
-	case "S":
+	case "ctrl+s":
 		return m.saveTrack()
+	case "S":
+		return m.switchToProvider("spotify")
 
 	case "m":
 		m.player.ToggleMono()
@@ -454,10 +470,10 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		m.prevFocus = m.focus
 		m.focus = focusSearch
 
-	case "f", "F":
+	case "f", "ctrl+f":
 		m.netSearch.active = true
 		m.netSearch.query = ""
-		m.netSearch.soundcloud = msg.String() == "F"
+		m.netSearch.soundcloud = msg.String() == "ctrl+f"
 		m.prevFocus = m.focus
 		m.focus = focusNetSearch
 
@@ -503,7 +519,11 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		}
 
 	case "R":
-		return m.openRadioCatalog()
+		return m.switchToProvider("radio")
+	case "P":
+		return m.switchToProvider("plex")
+	case "Y":
+		return m.switchToProvider("yt")
 
 	case "v":
 		m.vis.CycleMode()
@@ -666,7 +686,13 @@ func (m *Model) handleJumpKey(msg tea.KeyMsg) tea.Cmd {
 }
 
 // handleProvSearchKey processes key presses while filtering the provider playlist list.
+// For the radio provider, Enter fires an API search; for others, Enter loads the
+// selected result. Esc cancels and restores the normal catalog view.
 func (m *Model) handleProvSearchKey(msg tea.KeyMsg) tea.Cmd {
+	// Radio provider: API-based search (no live client-side filtering).
+	if rp, ok := m.provider.(*radio.Provider); ok {
+		return m.handleRadioProvSearchKey(msg, rp)
+	}
 	switch msg.Type {
 	case tea.KeyEscape:
 		m.provSearch.active = false
@@ -701,6 +727,47 @@ func (m *Model) handleProvSearchKey(msg tea.KeyMsg) tea.Cmd {
 		}
 	}
 	return nil
+}
+
+// handleRadioProvSearchKey handles search input for the radio provider.
+// Types a query, Enter fires API search, Esc cancels/clears.
+func (m *Model) handleRadioProvSearchKey(msg tea.KeyMsg, rp *radio.Provider) tea.Cmd {
+	switch msg.Type {
+	case tea.KeyEscape:
+		m.provSearch.active = false
+		m.restoreRadioCatalog(rp)
+	case tea.KeyEnter:
+		m.provSearch.active = false
+		if m.provSearch.query == "" {
+			m.restoreRadioCatalog(rp)
+			return nil
+		}
+		m.provLoading = true
+		return fetchRadioProvSearchCmd(m.provSearch.query)
+	case tea.KeyBackspace, tea.KeyDelete:
+		if m.provSearch.query != "" {
+			m.provSearch.query = removeLastRune(m.provSearch.query)
+		}
+	case tea.KeySpace:
+		m.provSearch.query += " "
+	default:
+		if msg.Type == tea.KeyRunes {
+			m.provSearch.query += string(msg.Runes)
+		}
+	}
+	return nil
+}
+
+// restoreRadioCatalog clears API search results and restores the normal catalog view.
+func (m *Model) restoreRadioCatalog(rp *radio.Provider) {
+	if !rp.IsSearching() {
+		return
+	}
+	rp.ClearSearch()
+	if lists, err := rp.Playlists(); err == nil {
+		m.providerLists = lists
+	}
+	m.provCursor = 0
 }
 
 func (m *Model) updateProvSearch() {

@@ -155,7 +155,7 @@ type Model struct {
 	plManager   plManagerState
 	fileBrowser fileBrowserState
 	navBrowser    navBrowserState
-	radioCatalog  radioCatalogState
+	radioBatch    radioBatchState
 	ytdlBatch     ytdlBatchState
 	reconnect   reconnectState
 	status      statusMsg
@@ -338,7 +338,7 @@ func (m Model) ThemeName() string {
 // use the slower tick rate.
 func (m *Model) isOverlayActive() bool {
 	return m.keymap.visible || m.themePicker.visible ||
-		m.fileBrowser.visible || m.navBrowser.visible || m.radioCatalog.visible ||
+		m.fileBrowser.visible || m.navBrowser.visible ||
 		m.plManager.visible ||
 		m.queue.visible || m.showInfo || m.search.active || m.netSearch.active ||
 		m.jumping || m.urlInputting
@@ -448,8 +448,20 @@ func (m *Model) switchProvider(idx int) tea.Cmd {
 	m.provLoading = true
 	m.provSignIn = false
 	m.provSearch.active = false
+	m.radioBatch = radioBatchState{} // reset catalog batch for new provider
 	m.focus = focusProvider
 	return fetchPlaylistsCmd(m.provider)
+}
+
+// switchToProvider finds a provider by config key and switches to it.
+// Returns nil if the provider is not configured.
+func (m *Model) switchToProvider(key string) tea.Cmd {
+	for i, pe := range m.providers {
+		if pe.Key == key {
+			return m.switchProvider(i)
+		}
+	}
+	return nil
 }
 
 // SetPendingURLs stores remote URLs (feeds, M3U) for async resolution after Init.
@@ -590,16 +602,6 @@ func (m *Model) openNavBrowser() {
 	m.navBrowser.searchIdx = nil
 }
 
-// openRadioCatalog opens the radio catalog overlay and fetches top stations.
-func (m *Model) openRadioCatalog() tea.Cmd {
-	m.radioCatalog = radioCatalogState{
-		visible:   true,
-		loading:   true,
-		favorites: radio.LoadFavorites(),
-	}
-	return fetchRadioTopCmd()
-}
-
 // Init starts the tick timer and requests the terminal size.
 func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{tickCmd(), tea.WindowSize()}
@@ -652,7 +654,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			frameW = min(frameW, 80)
 		}
 		frameStyle = frameStyle.Width(frameW)
-		panelWidth = max(0, frameW-6) // subtract horizontal padding (3 left + 3 right)
+		panelWidth = max(0, frameW-2*paddingH)
 		if m.fullVis {
 			m.vis.Rows = max(defaultVisRows, (m.height-10)*4/5)
 		}
@@ -660,7 +662,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// total height, then give the remaining space to the playlist.
 		// This avoids fragile manual line counting.
 		m.plVisible = 3 // temporary minimal value for measurement
-		probe := strings.Join([]string{
+		sections := []string{
 			m.renderTitle(),
 			m.renderTrackInfo(),
 			m.renderTimeStatus(),
@@ -669,13 +671,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.renderSeekBar(),
 			"",
 			m.renderControls(),
+			m.renderProviderPill(),
 			"",
 			m.renderPlaylistHeader(),
 			"x", // placeholder for playlist (1 line)
 			"",
 			m.renderHelp(),
 			m.renderStreamStatus(),
-		}, "\n")
+		}
+		// Clean up empty trailing sections to match View() logic
+		for len(sections) > 0 && sections[len(sections)-1] == "" {
+			sections = sections[:len(sections)-1]
+		}
+		probe := strings.Join(sections, "\n")
 		probeFrame := frameStyle.Render(probe)
 		fixedLines := lipgloss.Height(probeFrame) - 1 // subtract the 1-line placeholder
 		m.plVisible = max(3, min(maxPlVisible, m.height-fixedLines))
@@ -870,6 +878,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case []playlist.PlaylistInfo:
 		m.providerLists = msg
 		m.provLoading = false
+		// Start loading catalog stations when the radio provider is active.
+		if _, ok := m.provider.(*radio.Provider); ok && !m.radioBatch.loading && !m.radioBatch.done {
+			m.radioBatch.loading = true
+			return m, fetchRadioBatchCmd(m.radioBatch.offset, radioBatchSize)
+		}
 		return m, nil
 
 	case tracksLoadedMsg:
@@ -928,16 +941,48 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.navBrowser.screen = navBrowseScreenTracks
 		return m, nil
 
-	case radioCatalogLoadedMsg:
-		m.radioCatalog.loading = false
+	case radioBatchMsg:
+		m.radioBatch.loading = false
 		if msg.err != nil {
-			m.radioCatalog.err = msg.err.Error()
-		} else {
-			m.radioCatalog.stations = msg.stations
-			m.radioCatalog.err = ""
+			m.radioBatch.done = true
+			m.status.text = "Catalog load failed"
+			m.status.ttl = statusTTLDefault
+			return m, nil
 		}
-		m.radioCatalog.cursor = 0
-		m.radioCatalog.scroll = 0
+		if len(msg.stations) == 0 {
+			m.radioBatch.done = true
+			return m, nil
+		}
+		if rp, ok := m.provider.(*radio.Provider); ok {
+			rp.AppendCatalog(msg.stations)
+			if lists, err := rp.Playlists(); err == nil {
+				m.providerLists = lists
+			}
+		}
+		m.radioBatch.offset += len(msg.stations)
+		if len(msg.stations) < radioBatchSize {
+			m.radioBatch.done = true
+		}
+		return m, nil
+
+	case radioProvSearchMsg:
+		m.provLoading = false
+		if rp, ok := m.provider.(*radio.Provider); ok {
+			if msg.err != nil {
+				m.status.text = "Search failed"
+				m.status.ttl = statusTTLDefault
+			} else {
+				rp.SetSearchResults(msg.stations)
+				if lists, err := rp.Playlists(); err == nil {
+					m.providerLists = lists
+				}
+				m.provCursor = 0
+				if len(msg.stations) == 0 {
+					m.status.text = "No stations found"
+					m.status.ttl = statusTTLDefault
+				}
+			}
+		}
 		return m, nil
 
 	case ytdlBatchMsg:
