@@ -1750,12 +1750,9 @@ function renderStationStats(data,stationKey){
     tEl.appendChild(div);
   });
 
-  /* globe — only init once, use total countries for markers */
-  if(!window._globeInitialized){
-    window._radioCountries=totalCountries.length?totalCountries:activeCountries;
-    initGlobe(window._radioCountries);
-    window._globeInitialized=true;
-  }
+  /* globe — update with active listeners */
+  window._radioCountries=activeCountries;
+  initGlobe(activeCountries);
 }
 
 function renderRadioStats(){
