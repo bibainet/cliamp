@@ -1652,7 +1652,7 @@ function renderStationStats(data,stationKey){
         dailyMap[d.date].sessions+=d.sessions;
         dailyMap[d.date].listen_hours+=d.listen_hours;
       });
-      (s.top_countries||[]).forEach(function(c){
+      (s.active_listener_countries||[]).forEach(function(c){
         if(!countryMap[c.country_code])countryMap[c.country_code]={country:c.country,country_code:c.country_code,sessions:0};
         countryMap[c.country_code].sessions+=c.sessions;
       });
@@ -1701,7 +1701,7 @@ function renderStationStats(data,stationKey){
   }
 
   /* countries */
-  var countries=station.top_countries||[];
+  var countries=station.active_listener_countries||station.top_countries||[];
   var cEl=document.getElementById("radio-countries");
   cEl.textContent="";
   countries.forEach(function(c){
@@ -1765,59 +1765,194 @@ var countryCoords={
   HK:[22.40,114.11],NZ:[-40.90,174.89],PK:[30.38,69.35],BD:[23.68,90.36]
 };
 
-/* ── COBE globe ── */
-var _globeDestroy=null;
+/* ── Pure Canvas 2D globe with country outlines ── */
+var _globeAnim=null;
 var _globeResizeTimer=null;
+var _landPolygons=null;
+
+/* Minimal TopoJSON decoder — extracts rings from a topology object */
+function topoToPolygons(topo,objectName){
+  var obj=topo.objects[objectName];
+  var arcs=topo.arcs;
+  var tf=topo.transform;
+  var polys=[];
+
+  function decodeArc(arcIdx){
+    var reverse=arcIdx<0;
+    var idx=reverse?~arcIdx:arcIdx;
+    var arc=arcs[idx];
+    var coords=[];
+    var x=0,y=0;
+    for(var i=0;i<arc.length;i++){
+      x+=arc[i][0]; y+=arc[i][1];
+      coords.push([tf.scale[0]*x+tf.translate[0], tf.scale[1]*y+tf.translate[1]]);
+    }
+    if(reverse)coords.reverse();
+    return coords;
+  }
+
+  function ringFromArcs(arcRefs){
+    var pts=[];
+    for(var i=0;i<arcRefs.length;i++){
+      var c=decodeArc(arcRefs[i]);
+      for(var j=(i>0?1:0);j<c.length;j++) pts.push(c[j]);
+    }
+    return pts;
+  }
+
+  function extract(geom){
+    if(geom.type==="GeometryCollection"){
+      geom.geometries.forEach(extract);
+    }else if(geom.type==="Polygon"){
+      geom.arcs.forEach(function(ring){polys.push(ringFromArcs(ring))});
+    }else if(geom.type==="MultiPolygon"){
+      geom.arcs.forEach(function(polygon){
+        polygon.forEach(function(ring){polys.push(ringFromArcs(ring))});
+      });
+    }
+  }
+  extract(obj);
+  return polys;
+}
+
+/* Load land polygons once */
+function loadLand(cb){
+  if(_landPolygons)return cb(_landPolygons);
+  fetch("https://cdn.jsdelivr.net/npm/world-atlas@2/land-110m.json")
+    .then(function(r){return r.json()})
+    .then(function(topo){
+      _landPolygons=topoToPolygons(topo,"land");
+      cb(_landPolygons);
+    })
+    .catch(function(){cb([])});
+}
 
 function initGlobe(countries){
   var canvas=document.getElementById("radio-globe");
-  if(!canvas||typeof createGlobe==="undefined")return;
+  if(!canvas)return;
+  var ctx=canvas.getContext("2d");
+  if(!ctx)return;
 
-  /* Clean up previous globe instance */
-  if(_globeDestroy){try{_globeDestroy()}catch(e){}_globeDestroy=null;}
+  if(_globeAnim){cancelAnimationFrame(_globeAnim);_globeAnim=null;}
 
-  /* Size the buffer to match the actual CSS display size */
   var size=canvas.offsetWidth||320;
-  if(size<10)return; /* not laid out yet */
+  if(size<10)return;
   var dpr=Math.min(window.devicePixelRatio||1,2);
-  if(size<200)dpr=1; /* save GPU on tiny screens */
+  if(size<200)dpr=1;
   var buf=size*dpr;
   canvas.width=buf;
   canvas.height=buf;
+
+  var R=buf*0.42;
+  var cx=buf/2, cy=buf/2;
+  var tilt=0.15;
 
   var maxSessions=Math.max.apply(null,countries.map(function(c){return c.sessions}))||1;
   var markers=[];
   countries.forEach(function(c){
     var coords=countryCoords[c.country_code];
     if(!coords)return;
-    var s=0.03+0.12*(c.sessions/maxSessions);
-    markers.push({location:coords,size:s});
+    var lat=coords[0]*Math.PI/180;
+    var lng=coords[1]*Math.PI/180;
+    var s=3+6*(c.sessions/maxSessions);
+    markers.push({lat:lat,lng:lng,size:s*dpr});
   });
 
-  var phi=0;
-  _globeDestroy=createGlobe(canvas,{
-    devicePixelRatio:dpr,
-    width:buf,
-    height:buf,
-    phi:0,
-    theta:0.15,
-    dark:1,
-    diffuse:1.2,
-    mapSamples:size<280?8000:16000,
-    mapBrightness:6,
-    baseColor:[0.05,0.05,0.15],
-    markerColor:[0.45,0.82,1],
-    glowColor:[0.08,0.1,0.2],
-    markers:markers,
-    onRender:function(state){
-      state.phi=phi;
-      phi+=0.003;
+  var rotation=0;
+  function project(latD,lngD){
+    var lat=latD*Math.PI/180;
+    var lng=lngD*Math.PI/180+rotation;
+    var x=Math.cos(lat)*Math.sin(lng);
+    var y=Math.sin(lat)*Math.cos(tilt)-Math.cos(lat)*Math.cos(lng)*Math.sin(tilt);
+    var z=Math.sin(lat)*Math.sin(tilt)+Math.cos(lat)*Math.cos(lng)*Math.cos(tilt);
+    return {x:cx+x*R, y:cy-y*R, z:z};
+  }
+
+  function projectRad(lat,lng){
+    var l=lng+rotation;
+    var x=Math.cos(lat)*Math.sin(l);
+    var y=Math.sin(lat)*Math.cos(tilt)-Math.cos(lat)*Math.cos(l)*Math.sin(tilt);
+    var z=Math.sin(lat)*Math.sin(tilt)+Math.cos(lat)*Math.cos(l)*Math.cos(tilt);
+    return {x:cx+x*R, y:cy-y*R, z:z};
+  }
+
+  loadLand(function(land){
+    function draw(){
+      ctx.clearRect(0,0,buf,buf);
+
+      /* Glow */
+      var glow=ctx.createRadialGradient(cx,cy,R*0.8,cx,cy,R*1.3);
+      glow.addColorStop(0,"rgba(30,50,100,0.15)");
+      glow.addColorStop(1,"rgba(0,0,0,0)");
+      ctx.fillStyle=glow;
+      ctx.fillRect(0,0,buf,buf);
+
+      /* Ocean */
+      ctx.beginPath();
+      ctx.arc(cx,cy,R,0,Math.PI*2);
+      ctx.fillStyle="rgba(8,10,25,0.9)";
+      ctx.fill();
+      ctx.strokeStyle="rgba(40,55,100,0.3)";
+      ctx.lineWidth=1*dpr;
+      ctx.stroke();
+
+      /* Clip to globe circle */
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(cx,cy,R,0,Math.PI*2);
+      ctx.clip();
+
+      /* Draw land polygons */
+      for(var i=0;i<land.length;i++){
+        var ring=land[i];
+        var visible=false;
+        ctx.beginPath();
+        for(var j=0;j<ring.length;j++){
+          var p=project(ring[j][1],ring[j][0]);
+          if(p.z>0)visible=true;
+          if(j===0)ctx.moveTo(p.x,p.y);
+          else ctx.lineTo(p.x,p.y);
+        }
+        ctx.closePath();
+        if(visible){
+          ctx.fillStyle="rgba(30,45,80,0.7)";
+          ctx.fill();
+          ctx.strokeStyle="rgba(60,80,130,0.4)";
+          ctx.lineWidth=0.5*dpr;
+          ctx.stroke();
+        }
+      }
+
+      ctx.restore();
+
+      /* Country markers */
+      for(var j=0;j<markers.length;j++){
+        var m=markers[j];
+        var p=projectRad(m.lat,m.lng);
+        if(p.z<0)continue;
+        var alpha=0.4+0.6*p.z;
+
+        ctx.beginPath();
+        ctx.arc(p.x,p.y,m.size*2,0,Math.PI*2);
+        ctx.fillStyle="rgba(100,200,255,"+alpha*0.15+")";
+        ctx.fill();
+
+        ctx.beginPath();
+        ctx.arc(p.x,p.y,m.size,0,Math.PI*2);
+        ctx.fillStyle="rgba(115,210,255,"+alpha+")";
+        ctx.fill();
+      }
+
+      rotation+=0.003;
+      _globeAnim=requestAnimationFrame(draw);
     }
+
+    draw();
+    canvas.classList.add("loaded");
   });
-  canvas.classList.add("loaded");
 }
 
-/* Re-create globe on resize (e.g. orientation change) */
+/* Re-create globe on resize */
 window.addEventListener("resize",function(){
   clearTimeout(_globeResizeTimer);
   _globeResizeTimer=setTimeout(function(){
@@ -1827,13 +1962,6 @@ window.addEventListener("resize",function(){
 
 renderRadioStats();
 setInterval(renderRadioStats, 10000);
-</script>
-<script type="module">
-import createGlobe from "https://cdn.skypack.dev/cobe";
-window.createGlobe=createGlobe;
-/* Re-init globe if stats already loaded */
-var c=document.getElementById("radio-countries");
-if(c&&c.children.length>0)initGlobe(window._radioCountries||[]);
 </script>
 
 </body>
